@@ -1,4 +1,4 @@
-
+%%writefile cuda.cu
 #include <cuda_runtime.h>
 #include<cuda.h>
 #include <stdio.h>
@@ -247,62 +247,67 @@ __global__ void gatv2_forward_kernel(
     int node = blockIdx.x;        // Each thread block processes a node per head. total blocks (grid size) = N* num_heads. grid x-direction is node, y-direction is head.
     int head = blockIdx.y; 
            
-    if (node >= N || head >= num_heads || threadIdx.x>=max_degree) return;
+    if (node >= N || head >= num_heads || threadIdx.x > max_degree) return;
 
       //printf("check_kernel_start\n");
 
     // Shared memory for attention scores and softmax
     extern __shared__ float shared_mem[];
     float* attn_scores = shared_mem; // size = max_degree    //Assuming max degree is equal to the number of threads in the block 
-    float* head_output = &shared_mem[max_degree]; // [out_dim]     //it will start after the attn_scores array in shared memory. Each thread will write its output to this array.
+    float* head_output = &shared_mem[max_degree+1]; // [out_dim]     //it will start after the attn_scores array in shared memory. Each thread will write its output to this array.
     int row_start = d_row_ptr[node];     
     int row_end = d_row_ptr[node + 1];
     int degree = row_end - row_start;     // Number of neighbors for the current node.
 
-    // 1. Compute attention scores e_{ij}
-    for (int nbr_idx = threadIdx.x; nbr_idx < degree; nbr_idx += blockDim.x) {
-        int j = d_col_idx[row_start + nbr_idx];        // we are iterating over the neighbors of the Node 'node' in the graph. j is the neighbor node index.
+    // 1. Compute attention scores e_{ij} including self attention
+    if(threadIdx.x > degree) return;    
+    int j = d_col_idx[row_start + threadIdx.x];        // we are iterating over the neighbors of the Node 'node' in the graph. j is the neighbor node index.
 
-        // Concatenate x_i and x_j
-        float concat_x[2 * MAX_IN_DIM];        //concatenated feature vector of the node and its neighbor
+    // Concatenate x_i and x_j
+    float concat_x[2 * MAX_IN_DIM];        //concatenated feature vector of the node and its neighbor
+    if(threadIdx.x== degree) { // self attention
+        concat(&d_features[node * in_dim], &d_features[node * in_dim], concat_x, in_dim, in_dim);  // &d_features[node * in_dim] is the starting address of the features of the node itself.
+    } else {
         concat(&d_features[node * in_dim], &d_features[j * in_dim], concat_x, in_dim, in_dim);      // &d_features[j * in_dim] is the starting address of the features of the neighbor node j.
-
-        // Linear transformation: s = W * [x_i ; x_j]
-        float s[MAX_OUT_DIM];     // output vector after linear transformation
-        const float* W_head = &d_W[head * out_dim * 2 * in_dim];    // W_head points to the weight matrix for the current head.
-        matvec(W_head, concat_x, s, out_dim, 2 * in_dim);
-
-        // LeakyReLU
-        for (int k = 0; k < out_dim; ++k) s[k] = leaky_relu(s[k]);
-
-        // Attention score: e_{ij} = a^T * s
-        const float* a_head = &d_a[head * out_dim];   // a_head points to the attention vector for the current head.
-        attn_scores[nbr_idx] = dot(a_head, s, out_dim);
     }
+
+    // Linear transformation: s = W * [x_i ; x_j]
+    float s[MAX_OUT_DIM];     // output vector after linear transformation
+    const float* W_head = &d_W[head * out_dim * 2 * in_dim];    // W_head points to the weight matrix for the current head.
+    matvec(W_head, concat_x, s, out_dim, 2 * in_dim);
+
+    // LeakyReLU
+    for (int k = 0; k < out_dim; ++k) s[k] = leaky_relu(s[k]);
+
+    // Attention score: e_{ij} = a^T * s
+    const float* a_head = &d_a[head * out_dim];   // a_head points to the attention vector for the current head.
+    attn_scores[threadIdx.x] = dot(a_head, s, out_dim);     // Compute attention score for the neighbors and self attention. //self attenstion stored at the last index of the attn_scores array.
+    
     __syncthreads();
 
     // 2. Softmax over neighbors (in-place on attn_scores)
-    if (threadIdx.x == 0) softmax(attn_scores, degree);
+    if (threadIdx.x == 0) softmax(attn_scores, degree + 1); // Softmax over all neighbors including self attention. degree+1 because we have self attention as well.
     __syncthreads();
 
     // 3. Aggregate neighbor features using attention scores
-    if (threadIdx.x < out_dim)
-    head_output[threadIdx.x] = 0.0f;     //since we do atomicAdd, we need to initialize the output vector to zero before accumulating values.
+    for (int i = threadIdx.x; i < out_dim; i += blockDim.x)
+        head_output[i] = 0.0f;  //since we do atomicAdd, we need to initialize the output vector to zero before accumulating values.
     __syncthreads();
 
     const float* W_head_right = d_W_head_right + head * out_dim * in_dim;    // W_head_right points to the right part of the weight matrix FOR THE CURRENY HEAD.
 
-    for (int nbr_idx = threadIdx.x; nbr_idx < degree; nbr_idx += blockDim.x) {
-        int j = d_col_idx[row_start + nbr_idx];
-
-        // Use the matvec utility for W_head_right * x_j
-        float W_xj[MAX_OUT_DIM];                                                 // output vector after multiplying the right part of the weight matrix with the neighbor's features
-        matvec(W_head_right, &d_features[j * in_dim], W_xj, out_dim, in_dim);
-
-        // Accumulate weighted neighbor features
-        for (int k = 0; k < out_dim; ++k)
-            atomicAdd(&head_output[k], attn_scores[nbr_idx] * W_xj[k]);     // Multiply attention score with the transformed neighbor features and accumulate to the output vector (per node per head wise).
+        
+    // Use the matvec utility for W_head_right * x_j
+    float W_xj[MAX_OUT_DIM];                                                 // output vector after multiplying the right part of the weight matrix with the neighbor's features
+    if(threadIdx.x == degree) { // self attention
+        matvec(W_head_right, &d_features[node * in_dim], W_xj, out_dim, in_dim);  // self attention
+    } else {
+        matvec(W_head_right, &d_features[j * in_dim], W_xj, out_dim, in_dim);     // neighbor attention
     }
+
+    // Accumulate weighted neighbor features
+    for (int k = 0; k < out_dim; ++k)
+        atomicAdd(&head_output[k], attn_scores[threadIdx.x] * W_xj[k]);     // Multiply attention score with the transformed neighbor features and accumulate to the output vector (per node per head wise).
 
     __syncthreads();
 
@@ -310,13 +315,14 @@ __global__ void gatv2_forward_kernel(
     if (is_last_layer) {
     // Each block computes head_output for (node, head)
     // Each thread block: (node, head)
-    if (threadIdx.x == 0) {
-        for (int k = 0; k < out_dim; ++k) {
-            // Atomic add each head's output to the node's output slot
-            atomicAdd(&d_out[node * out_dim + k], head_output[k] / num_heads);
+        if (threadIdx.x == 0) {
+            for (int k = 0; k < out_dim; ++k) {
+                // Atomic add each head's output to the node's output slot
+                atomicAdd(&d_out[node * out_dim + k], head_output[k] / num_heads);
+            }
         }
     }
-    } else {
+    else {
         // For intermediate layers: concatenate output per head
         if (threadIdx.x == 0) {
             for (int k = 0; k < out_dim; ++k)
@@ -352,8 +358,19 @@ __global__ void gatv2_forward_kernel(
     //         printf("\n");
     //     }
     // }
-   
-    
+
+    //print attention scores for node 0 and head 0 only for debugging
+    // if (node == 0 && head == 0 && threadIdx.x == 0) {
+    //     printf("Attention scores for node 0, head 0: ");
+    //     //also print the node 0 degree
+    //     printf("Degree: %d, ", degree);
+    //     printf("\n")
+    //     for (int i = 0; i < degree + 1; ++i) {
+    //         printf("%f ", attn_scores[i]);
+    //     }
+    //     printf("\n");
+    // }
+
 }
 
 // Kernel definition for GATv2 output calculation
@@ -598,8 +615,8 @@ int main() {
     float* d_layer_inputs = d_features;
     for (int l = 0; l < L; ++l) {
         dim3 grid(num_nodes, head[l]);
-        int block = max_degree; // or set to max degree or a tuned value
-        size_t shared_mem = (max_degree+out_dim[l]) * sizeof(float); 
+        int block = max_degree + 1; // or set to max degree or a tuned value
+        size_t shared_mem = (max_degree+1+out_dim[l]) * sizeof(float); 
         bool is_last_layer = (l == L - 1);
         const float* d_w_l = d_w + (l > 0 ? w_offset[l-1] : 0); // Left half of weights for this layer
         const float* d_a_l = d_a + (l > 0 ? a_offset[l-1] : 0); // Attention vector for this layer
