@@ -260,7 +260,8 @@ __global__ void gatv2_forward_kernel(
     int degree = row_end - row_start;     // Number of neighbors for the current node.
 
     // 1. Compute attention scores e_{ij} including self attention
-    if(threadIdx.x > degree) return;    
+    if(threadIdx.x > degree) return;   
+
     int j = d_col_idx[row_start + threadIdx.x];        // we are iterating over the neighbors of the Node 'node' in the graph. j is the neighbor node index.
 
     // Concatenate x_i and x_j
@@ -311,24 +312,56 @@ __global__ void gatv2_forward_kernel(
 
     __syncthreads();
 
-    // Write output
-    if (is_last_layer) {
-    // Each block computes head_output for (node, head)
-    // Each thread block: (node, head)
+    // --- Nonlinearity after aggregation ---
+
+    if (!is_last_layer) {
+         for (int i = threadIdx.x; i < out_dim; i += blockDim.x) {
+            head_output[i] = leaky_relu(head_output[i]);   // replace relu with your activation
+        }
+        __syncthreads();
+        // Concatenate heads
+        for (int i = threadIdx.x; i < out_dim; i += blockDim.x) {
+            d_out[node * num_heads * out_dim + head * out_dim + i] = head_output[i];
+        }
+
+    } 
+    else {
+        // Average over heads
         if (threadIdx.x == 0) {
-            for (int k = 0; k < out_dim; ++k) {
-                // Atomic add each head's output to the node's output slot
+            for (int k = 0; k < out_dim; ++k)
                 atomicAdd(&d_out[node * out_dim + k], head_output[k] / num_heads);
+        }
+        __syncthreads();
+
+        // --- Nonlinearity after averaging in last layer ---
+        if (head == 0) {
+            for (int i = threadIdx.x; i < out_dim; i += blockDim.x) {
+                d_out[node * out_dim + i] = leaky_relu(d_out[node * out_dim + i]);
             }
         }
     }
-    else {
-        // For intermediate layers: concatenate output per head
-        if (threadIdx.x == 0) {
-            for (int k = 0; k < out_dim; ++k)
-                d_out[node * num_heads * out_dim + head * out_dim + k] = head_output[k];
-        }
-    }
+    
+
+
+    // Write output
+    // if (is_last_layer) {
+    // // Each block computes head_output for (node, head)
+    // // Each thread block: (node, head)
+    //     if (threadIdx.x == 0) {
+    //         for (int k = 0; k < out_dim; ++k) {
+    //             // Atomic add each head's output to the node's output slot
+    //             atomicAdd(&d_out[node * out_dim + k], head_output[k] / num_heads);
+    //         }
+    //     }
+    // }
+    // else {
+    //     // For intermediate layers: concatenate output per head
+    //     if (threadIdx.x == 0) {
+    //         for (int k = 0; k < out_dim; ++k)
+    //             d_out[node * num_heads * out_dim + head * out_dim + k] = head_output[k];
+    //     }
+    // }
+    
 
     //print d_out one node for debugging
     // if (node == 0 && head == 0 && threadIdx.x == 0) {
