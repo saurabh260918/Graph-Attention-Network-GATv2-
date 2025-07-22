@@ -15,8 +15,8 @@
 #include <thrust/extrema.h>
 #include <thrust/host_vector.h>
 
-#define MAX_OUT_DIM 17
-#define MAX_IN_DIM 50
+#define MAX_OUT_DIM 1000
+#define MAX_IN_DIM 1500
 
 
 
@@ -60,6 +60,21 @@ void load_int_array(const std::string& filename, int** arr, int& length) {
     length = values.size();
     *arr = new int[length];
     std::copy(values.begin(), values.end(), *arr);
+}
+
+
+
+
+int compute_max_degree(const int* h_row_ptr, int num_nodes) {
+    int max_degree = 0;
+    //int num_nodes = h_row_ptr.size() - 1;
+    for (int i = 0; i < num_nodes; ++i) {
+        int degree = h_row_ptr[i + 1] - h_row_ptr[i];
+        if (degree > max_degree) {
+            max_degree = degree;
+        }
+    }
+    return max_degree;
 }
 
 
@@ -511,19 +526,27 @@ int main() {
 
    
     
-    int max_degree = 20 ;      //hardcoded for now, but can be computed from h_row_ptr traversal.
+    //int max_degree = 20 ;      //hardcoded for now, but can be computed from h_row_ptr traversal.
+    int max_degree = compute_max_degree(h_row_ptr, num_nodes);
+
 
     //std::cout << "Max degree = " << max_degree << std::endl;
 
      // 2. Define GATv2 architecture
     const int L = 3; // Example: 3 layers
-    int head[L] = {2, 2, 2};         // Number of heads per layer
-    int out_dim[L] = {10, 10, 10};    // Output dim per head per layer
+    int head[L] = {1, 1, 1};         // Number of heads per layer
+    int out_dim[L] = {1000, 500, 100};    // Output dim per head per layer
+    // int out_dim[L];
+    // int prev_dim = input_dim;
+    // for (int i = 0; i < L; ++i) {
+    //     out_dim[i] = prev_dim / 2;
+    //     prev_dim = out_dim[i];
+    // }
     int in_dim[L]= {input_dim}; // Input dim for first layer, subsequent layers will be computed based on previous layer's output.
     in_dim[0] = input_dim;
     for (int l = 1; l < L; ++l)
         in_dim[l] = head[l-1] * out_dim[l-1];
-    int C = 20; // C class classification problem.
+    int C = 7; // C class classification problem.
 
     // 3. Declare device pointers for all parameters and caches
     int* d_head;          // Device array for number of heads per layer
