@@ -11,14 +11,14 @@
 #include <vector>
 #include <algorithm>
 #include <sstream>
-#include <string> 
+#include <string>
 #include <thrust/extrema.h>
 #include <thrust/host_vector.h>
 #include <thrust/device_ptr.h>
 #include <thrust/reduce.h>
 
-#define MAX_OUT_DIM 1000
-#define MAX_IN_DIM 1500
+#define MAX_OUT_DIM 100
+#define MAX_IN_DIM 50
 
 
 
@@ -192,9 +192,9 @@ __global__ void xavier_init_kernel(
             float rnd = ((local_seed % 100000) / 100000.0f) * 2.0f * limit - limit;
             d_wo[r * out_d + o] = rnd;  // d_wo is [C x out_dim_last_layer] in row-major
         }
-        
+
     }
- 
+
 
 }
 
@@ -376,7 +376,7 @@ __global__ void compute_output_gradients(
     float* grad_d_wo,        // [C][out_dim_L], output: grad for W_o
     float* grad_d_hL,        // [N][num_heads][out_dim_L], output: grad for h_i^L (pre-activation) per head
     int N, int C, int out_dim_L,
-    int num_heads,  
+    int num_heads,
     float negative_slope     // LeakyReLU slope
 ) {
     int node = blockIdx.x * blockDim.x + threadIdx.x;
@@ -413,9 +413,21 @@ __global__ void compute_output_gradients(
         float derivative = (h_val > 0.0f) ? 1.0f : negative_slope;
         for (int h = 0; h < num_heads; ++h) {
             grad_d_hL[node * num_heads * out_dim_L + h * out_dim_L + d] =
-                sum * derivative * inv_heads;   
+                sum * derivative * inv_heads;
         }
     }
+    // if (node == 0) {
+    //     printf("grad_d_hL for node 0: ");
+    //     for (int i = 0; i < 20 && i < num_heads * out_dim_L; ++i) {
+    //         printf("%f ", grad_d_hL[i]);
+    //     }
+    //     printf("\n");
+    // }
+    if (node == 0) {
+        printf("Size of grad_d_hL for node 0: %d\n", num_heads * out_dim_L);
+    }
+
+
 }
 
 
@@ -439,7 +451,9 @@ __global__ void gatv2_layer_backward(
     float* grad_x_lower,      // [N][in_dim]    // gradient of input features
     float negative_slope,
     int max_degree,
-    bool last_layer // 0 if not last layer, 1 if last layer
+    bool last_layer, // 0 if not last layer, 1 if last layer
+    int layer,
+    unsigned long long total_grad_w_size
 ) {
     int i = blockIdx.x;    // Node index
     int h = blockIdx.y;    // Head index
@@ -447,6 +461,12 @@ __global__ void gatv2_layer_backward(
     //create a shared memory equal to max_degree+out_dim
     extern __shared__ float shared_memory[];    //size max_degree
     float* dL_d_h = &shared_memory[max_degree]; // size out_dim
+    if (i == 0 && tid==0) {
+       //printf("Debug Info gatv2_layer_backward stage-1 \n");
+    }
+    // if(layer==1 && i==0 && h==0 && tid==0){
+    //     printf("grad_w size: %d\n", num_heads * out_dim * 2 * in_dim    );
+    // }
 
     if(!last_layer){
         for (int od = tid; od < out_dim; od += blockDim.x) {
@@ -457,13 +477,16 @@ __global__ void gatv2_layer_backward(
             d_higher_pre[(i * num_heads + h) * out_dim + od] = dL_d_h[od]; // Store pre-activation gradient in global memory
         }
     }
-    
+
     else{
         for (int od = tid; od < out_dim; od += blockDim.x){
             dL_d_h[od] = d_higher[(i * num_heads + h) * out_dim + od];
             d_higher_pre[(i * num_heads + h) * out_dim + od] = dL_d_h[od];
         }
 
+    }
+    if (i == 0 && tid==0) {
+        //printf("Debug Info gatv2_layer_backward stage-2 \n");
     }
     __syncthreads();
 
@@ -485,22 +508,42 @@ __global__ void gatv2_layer_backward(
             dL_d_alpha_ij += dL_d_h[od] * w_ * d_x[j*in_dim + id];
         }
     }
+    if (i == 0 && tid==0) {
+        //printf("Debug Info gatv2_layer_backward stage-3 \n");
+    }
+
     // Store dL/d alpha_ij in shared memory for later use
     shared_memory[tid] = dL_d_alpha_ij;
     __syncthreads(); // Ensure all threads have written their values
 
+    if (i == 0 && tid==0) {
+        //printf("Debug Info gatv2_layer_backward stage-3i \n");
+    }
 
     // --- Step D.4: grad_W direct ---
     float alpha = attn_coeff[(i * num_heads + h) * max_degree + (tid)];
+
+    //if (i == 0 && tid==0) printf("Debug Info gatv2_layer_backward stage-3ii \n");
+
     for (int od = 0; od < out_dim; ++od) {
-        //float dL_d_h = d_higher[(i * num_heads + h) * out_dim + od];
+        //if(i==10 && h==0 && tid==0) printf("Debug Info gatv2_layer_backward stage-4i od=%d \n", od);
+
+        //float dL_d_h = d_higher_pre[(i * num_heads + h) * out_dim + od];
         for (int id = 0; id < in_dim; ++id) {
             float x_j = d_x[j*in_dim + id];
             atomicAdd(&grad_w[(h*out_dim*2*in_dim) + (od*2*in_dim) + (in_dim + id)], alpha * dL_d_h[od] * x_j);    //here massive sequential addition possible
+            if (layer==1 && threadIdx.x == 0 && blockIdx.x == 0 && blockIdx.y == 0 && od == 0 && id >=0 && id < in_dim) {
+                //printf("Debug Info gatv2_layer_backward stage-4i: id=%d \n", id);
+            }
         }
     }
+//---------------------------------------------------
+//--------------------------------------------------
+    if (i == 0 && tid==0) {
+        //printf("Debug Info gatv2_layer_backward stage-4 \n");
+    }
 
-    // --- Step E.1: dL/d e_ij ---  
+    // --- Step E.1: dL/d e_ij ---
     float dL_d_e_ij = 0.0f;
     float alpha_ij = attn_coeff[(i * num_heads + h) * max_degree + tid];
     for (int kk = 0; kk < deg; ++kk) {
@@ -533,6 +576,10 @@ __global__ void gatv2_layer_backward(
         }
     }
 
+    if (i == 0 && tid==0) {
+        //printf("Debug Info gatv2_layer_backward stage-5 \n");
+    }
+
     // ---- DIRECT GRADIENT FOR x_i ----
     // For node i as a neighbor of node j, accumulate to grad_x_lower[i][*] as per direct formula
     int offset = -1;
@@ -556,6 +603,10 @@ __global__ void gatv2_layer_backward(
         }
     }
 
+    if (i == 0 && tid==0) {
+        //printf("Debug Info gatv2_layer_backward stage-6 \n");
+    }
+
     // ---- INDIRECT GRADIENT FOR x_i ----
     for (int od = 0; od < out_dim; ++od) {
         // Compute LeakyReLU' for this dimension
@@ -569,6 +620,9 @@ __global__ void gatv2_layer_backward(
             float grad_contrib = elem * W_left;
             atomicAdd(&grad_x_lower[i * in_dim + id], grad_contrib);
         }
+    }
+    if (i == 0 && tid==0) {
+        //printf("Debug Info gatv2_layer_backward stage-last \n");
     }
 
 }
@@ -651,7 +705,7 @@ int main() {
     const int L = 3; // Example: 3 layers
     int C = 7; // C class classification problem.  //hardcoded for now.
     int head[L] = {1, 1, 1};         // Number of heads per layer
-    int out_dim[L] = {1000, 500, 100};    // Output dim per head per layer
+    int out_dim[L] = {25, 50, 100};    // Output dim per head per layer
     // int out_dim[L];
     // int prev_dim = input_dim;
     // for (int i = 0; i < L; ++i) {
@@ -662,7 +716,7 @@ int main() {
     in_dim[0] = input_dim;
     for (int l = 1; l < L; ++l)
         in_dim[l] = head[l-1] * out_dim[l-1];
-    
+
 
     // 3. Declare device pointers for all parameters and caches
     int* d_head;          // Device array for number of heads per layer
@@ -739,7 +793,7 @@ int main() {
     }
 
 
-    
+
     err = cudaMalloc(&d_head, L * sizeof(int));
     //printf("cudaMalloc d_head: %s\n", cudaGetErrorString(err));
 
@@ -762,21 +816,26 @@ int main() {
     size_t total_w = 0, total_a = 0;
     int w_offset[L]= {0}; // Offsets for weights
     int a_offset[L]= {0}; // Offsets for attention vectors
-    for (int l = 0; l < L; ++l) {
-        w_offset[l] = head[l] * out_dim[l] * 2 * in_dim[l];
-        a_offset[l] = head[l] * out_dim[l];
-        total_w += w_offset[l];
-        total_a += a_offset[l];
+    for (int l = 1; l < L; ++l) {
+        w_offset[l] = w_offset[l-1] + head[l-1] * out_dim[l-1] * 2 * in_dim[l-1];
+        a_offset[l] = a_offset[l-1] + head[l-1] * out_dim[l-1];
+        total_w += head[l-1] * out_dim[l-1] * 2 * in_dim[l-1];
+        total_a += head[l-1] * out_dim[l-1];
     }
+    total_w += head[L-1] * out_dim[L-1] * 2 * in_dim[L-1]; // Last layer weights
+    total_a += head[L-1] * out_dim[L-1]; // Last layer attention vectors
+
     cudaMalloc(&d_w, total_w * sizeof(float));
     cudaMalloc(&d_a, total_a * sizeof(float));
     cudaMalloc(&d_wo, C * out_dim[L - 1] * sizeof(float));
     cudaMalloc(&d_z, num_nodes * C * sizeof(float));
     cudaMalloc(&d_y, num_nodes * C * sizeof(float));
     cudaMalloc(&grad_wo, C * out_dim[L-1] * sizeof(float));
+    cudaMemset(grad_wo, 0, C * out_dim[L-1] * sizeof(float)); // Initialize to zero
     cudaMalloc(&grad_d_w, total_w * sizeof(float));
+    cudaMemset(grad_d_w, 0, total_w * sizeof(float)); // Initialize to zero
     cudaMalloc(&grad_d_a, total_a * sizeof(float));
-    
+    cudaMemset(grad_d_a, 0, total_a * sizeof(float)); // Initialize to zero
 
     int max_heads_per_layer = *std::max_element(head, head + L);  // Maximum number of heads across all layers
     int max_out_dim = *std::max_element(out_dim, out_dim + L); // Maximum output dimension across all layers
@@ -788,6 +847,14 @@ int main() {
     xavier_init_kernel<<<grid, block>>>(d_w, d_a, d_wo, d_head, d_in_dim, d_out_dim, C, L, time(NULL));
     cudaDeviceSynchronize();
 
+    // Check for errors
+    err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "Error launching xavier_init_kernel: %s\n", cudaGetErrorString(err));
+    }
+
+
+
     float* d_loss;      // [num_nodes]
     int*   d_correct;   // [num_nodes]
     cudaMalloc(&d_loss,    num_nodes * sizeof(float));
@@ -795,20 +862,22 @@ int main() {
 
     // Allocate output gradient buffers: one per layer, size: N x in_dim[l]
     float** output_gradients = new float*[L];
+    float** grad_d_higher_pre = new float*[L]; // Gradient of pre-activation output of higher layer
     for (int l = 0; l < L; ++l) {
-        size_t size = (size_t)num_nodes * in_dim[l] * sizeof(float);
-        cudaMalloc(&output_gradients[l], size);
-        cudaMemset(output_gradients[l], 0, size);  // Initialize to zero
+        size_t size1 = (size_t)num_nodes * in_dim[l] * sizeof(float);
+        size_t size2 = (size_t)num_nodes * out_dim[l]* head[l] * sizeof(float);
+        cudaMalloc(&output_gradients[l], size1);
+        cudaMalloc(&grad_d_higher_pre[l], size2);
+        cudaMemset(output_gradients[l], 0, size1);  // Initialize to zero
+        cudaMemset(grad_d_higher_pre[l], 0, size2); // Initialize to zero
     }
     float* input_gradient_last_layer; // Gradient buffer for the last layer input
-    float* grad_d_higher_pre; // Gradient of pre-activation output of higher layer
-    cudaMalloc(&grad_d_higher_pre, num_nodes * head[L-1] * out_dim[L-1] * sizeof(float));
-    cudaMemset(grad_d_higher_pre, 0, num_nodes * head[L-1] * out_dim[L-1] * sizeof(float)); // Initialize to zero
+
     // Allocate input gradient buffer for the last layer: size: N x (last layer no. of heads x out_dim_last layer)
     cudaMalloc(&input_gradient_last_layer, num_nodes * head[L-1] * out_dim[L-1] * sizeof(float));
     cudaMemset(input_gradient_last_layer, 0, num_nodes * head[L-1] * out_dim[L-1] * sizeof(float)); // Initialize to zero
 
-    for (int epoch = 0; epoch < 4; ++epoch) {
+    for (int epoch = 1; epoch <=15; ++epoch) {
 
         // b. Forward pass for each layer
         float* d_layer_inputs = d_features;
@@ -817,14 +886,20 @@ int main() {
             int block = max_degree;
             size_t shared_mem = (max_degree + out_dim[l]) * sizeof(float);
             bool is_last_layer = (l == L - 1);
-            const float* d_w_l = d_w + (l > 0 ? w_offset[l-1] : 0);
-            const float* d_a_l = d_a + (l > 0 ? a_offset[l-1] : 0);
+            const float* d_w_l = d_w + w_offset[l];
+            const float* d_a_l = d_a + a_offset[l];
 
             gatv2_forward_kernel<<<grid, block, shared_mem>>>(
                 num_nodes, in_dim[l], out_dim[l], head[l], d_layer_inputs,
                 d_row_ptr, d_col_idx, d_w_l, d_a_l, d_h[l], d_layer_outputs[l],
                 attn_score[l], attn_coeff[l], d_leakyrelu[l], d_s[l], is_last_layer, max_degree
             );
+
+            //check for error
+            err = cudaGetLastError();
+            if (err != cudaSuccess) {
+                fprintf(stderr, "Error launching gatv2_forward_kernel: %s\n", cudaGetErrorString(err));
+            }
             cudaDeviceSynchronize();
             d_layer_inputs = d_layer_outputs[l];
         }
@@ -833,13 +908,17 @@ int main() {
         int num_blocks = (num_nodes + threads_per_block - 1) / threads_per_block;
 
         gatv2_output_kernel<<<num_blocks, threads_per_block>>>(d_wo,  d_layer_inputs, d_z, d_y, num_nodes, C, out_dim[L - 1]);
-
+        // Check for errors after gatv2_output_kernel
+        err = cudaGetLastError();
+        if (err != cudaSuccess) {
+            fprintf(stderr, "Error launching gatv2_output_kernel: %s\n", cudaGetErrorString(err));
+        }
+        cudaDeviceSynchronize();
         // c. Calculate loss and accuracy ----
 
         int threads = 256;
         int blocks = (num_nodes + threads - 1) / threads;
-        compute_loss_accuracy_kernel<<<blocks, threads>>>(
-            d_y, d_labels, d_loss, d_correct, num_nodes, C);
+        compute_loss_accuracy_kernel<<<blocks, threads>>>(d_y, d_labels, d_loss, d_correct, num_nodes, C);
         cudaDeviceSynchronize();
 
         compute_loss_and_accuracy(num_nodes, d_loss, d_correct);
@@ -852,32 +931,40 @@ int main() {
             d_y, d_labels, d_h[L-1], d_layer_outputs[L-1], d_wo, grad_wo,
             grad_input, num_nodes, C, out_dim[L-1], head[L-1], negative_slope
         );
+        // Check for errors after compute_output_gradients
+        err = cudaGetLastError();
+        if (err != cudaSuccess) {
+            fprintf(stderr, "Error launching compute_output_gradients: %s\n", cudaGetErrorString(err));
+        }
         cudaDeviceSynchronize();
 
         // 2: Loop backward through GAT layers
         for (int l = L-1; l >= 0; --l) {
+            //printf("Backward pass for layer %d\n", l);
             dim3 grid(num_nodes, head[l]);
             int block = max_degree;
             size_t shared_mem = (max_degree + out_dim[l]) * sizeof(float);
-            float* d_w_l = d_w + (l > 0 ? w_offset[l-1] : 0);
-            float* d_a_l = d_a + (l > 0 ? a_offset[l-1] : 0);
+            float* d_w_l = d_w + w_offset[l];
+            float* d_a_l = d_a + a_offset[l];
             bool is_last_layer = (l == L - 1);
             float* grad_output = output_gradients[l];
             gatv2_layer_backward<<<grid, block, shared_mem>>>(
-                num_nodes, in_dim[l], out_dim[l], head[l],
-                d_row_ptr, d_col_idx,
-                d_layer_outputs[(l > 0) ? l-1 : 0], // d_x
-                grad_input, grad_d_higher_pre, d_h[l], attn_coeff[l], attn_score[l],
-                d_leakyrelu[l], d_w_l, d_a_l,
-                grad_d_w + ((l > 0) ? w_offset[l-1] : 0),
-                grad_d_a + ((l > 0) ? a_offset[l-1] : 0), d_s[l],
-                grad_output, negative_slope, max_degree, is_last_layer
-            );
+                num_nodes, in_dim[l], out_dim[l], head[l], d_row_ptr, d_col_idx,
+                (l > 0) ? d_layer_outputs[l - 1] : d_features, grad_input, grad_d_higher_pre[l], d_h[l],
+                attn_coeff[l], attn_score[l], d_leakyrelu[l], d_w_l, d_a_l,
+                grad_d_w + w_offset[l], grad_d_a + a_offset[l],
+                d_s[l], grad_output, negative_slope, max_degree, is_last_layer, l, total_w);
+
+            // Check for errors after gatv2_layer_backward
+            err = cudaGetLastError();
+            if (err != cudaSuccess) {
+                fprintf(stderr, "Error launching gatv2_layer_backward: %s\n", cudaGetErrorString(err));
+            }
             cudaDeviceSynchronize();
 
             // Prepare input gradient for next iteration down the stack
             grad_input = grad_output; // input gradient of this layer becomes output gradient of next lower layer
-            
+
         }
 
         // -----> *** 5. PARAMETER UPDATE SECTION —  ***
@@ -888,19 +975,31 @@ int main() {
         // --- Update d_w ---
         int num_blocks_w = (total_w + block_size - 1) / block_size;
         sgd_update_kernel<<<num_blocks_w, block_size>>>(d_w, grad_d_w, lr, total_w);
+        err = cudaGetLastError();
+        if (err != cudaSuccess) {
+            fprintf(stderr, "Error launching sgd_update_kernel for d_w: %s\n", cudaGetErrorString(err));
+        }
 
         // --- Update attention vectors d_a ---
         int num_blocks_a = (total_a + block_size - 1) / block_size;
         sgd_update_kernel<<<num_blocks_a, block_size>>>(d_a, grad_d_a, lr, total_a);
+        err = cudaGetLastError();
+        if (err != cudaSuccess) {
+            fprintf(stderr, "Error launching sgd_update_kernel for d_a: %s\n", cudaGetErrorString(err));
+        }
 
         // --- Update output weights d_wo ---
         int total_wo = C * out_dim[L - 1];
         int num_blocks_wo = (total_wo + block_size - 1) / block_size;
         sgd_update_kernel<<<num_blocks_wo, block_size>>>(d_wo, grad_wo, lr, total_wo);
+        err = cudaGetLastError();
+        if (err != cudaSuccess) {
+            fprintf(stderr, "Error launching sgd_update_kernel for d_wo: %s\n", cudaGetErrorString(err));
+        }
 
-        cudaDeviceSynchronize(); 
+        cudaDeviceSynchronize();
 
-        // 6. 
+        // 6.
         cudaMemset(grad_d_w, 0, total_w * sizeof(float));
         cudaMemset(grad_d_a, 0, total_a * sizeof(float));
         cudaMemset(grad_wo, 0, total_wo * sizeof(float));
@@ -908,10 +1007,12 @@ int main() {
         //memset the output gradients to zero
         for (int l = 0; l < L; ++l) {
             cudaMemset(output_gradients[l], 0, num_nodes * in_dim[l] * sizeof(float));
+            cudaMemset(grad_d_higher_pre[l], 0, num_nodes * out_dim[l] * head[l] * sizeof(float));
         }
+
     }
 
-  
+
 
     // Stop timer
     auto stop = std::chrono::high_resolution_clock::now();
