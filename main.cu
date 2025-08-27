@@ -872,10 +872,10 @@ int main() {
     // int C = *itr + 1; // Number of classes, assuming labels are 0-indexed
 
      // 2. Define GATv2 architecture
-    const int L = 3; // Example: 5 layers
+    const int L = 2; // Example: 5 layers
     int C = 7; // C class classification problem.
-    int head[L] = {1,1,1};         // Number of heads per layer
-    int out_dim[L] = {700, 350, 14};    // Output dim per head per layer
+    int head[L] = {4,1};         // Number of heads per layer
+    int out_dim[L] = {150, 7};    // Output dim per head per layer
     // int out_dim[L];
     // int prev_dim = input_dim;
     // for (int i = 0; i < L; ++i) {
@@ -1457,7 +1457,7 @@ int main() {
         //     clip_grad_norm(grad_d_a, total_a, 5.0f);
         //     clip_grad_norm(grad_wo, C * out_dim[L - 1], 5.0f);
         // //_________________________________________________
-        float lr = 0.0003f; // Set your learning rate
+        float lr = 0.0005f; // Set your learning rate
 
         int block_size = 256;
 
