@@ -366,8 +366,6 @@ __global__ void compute_attn_coeff(const int* __restrict__ d_col_idx, const int*
 
     int h = tid / E;   // head index
     int e = tid % E;   // edge index
-
-    int src = d_col_idx[e];
     int dst = d_dst[e];
 
     // offset for max/sum arrays: each node has H heads
@@ -432,7 +430,6 @@ __global__ void postActivationLayerOutput(
     bool is_last_layer,
     float negative_slope)
 {
-    int threads_per_node = out_dim;
     int nodes_per_block = blockDim.x / out_dim; // e.g. 256/64 = 4
     int node_local = threadIdx.x / out_dim;     // which node inside the block
     int feat_idx   = threadIdx.x % out_dim;     // which feature index
@@ -928,6 +925,12 @@ __global__ void sgd_update_kernel(float* params, float* grads, float lr, size_t 
 
 
 int main(int argc, char** argv) {
+    // Measure GPU memory before allocations
+    size_t free_before, total_mem;
+    cudaMemGetInfo(&free_before, &total_mem);
+    printf("\n[Memory Tracker] Before allocation:\n");
+    printf("  Total GPU memory: %.2f MB\n", total_mem / (1024.0 * 1024.0));
+    printf("  Free GPU memory : %.2f MB\n", free_before / (1024.0 * 1024.0));
     // Default hyperparameters
     int epochs = 200;
     int L = 2;
@@ -1353,6 +1356,15 @@ int main(int argc, char** argv) {
     cudaMalloc(&d_max_attn_score, max_size);
     cudaMalloc(&d_sum_score_exp, max_size);
 
+    //**************************||**************************************//
+    // Measure GPU memory after all allocations
+    size_t free_after;
+    cudaMemGetInfo(&free_after, &total_mem);
+    double used_mb = (double)(free_before - free_after) / (1024.0 * 1024.0);
+
+    printf("\n[Memory Tracker] After all allocations:\n");
+    printf("  Free GPU memory : %.2f MB\n", free_after / (1024.0 * 1024.0));
+    printf("  Approx. GPU memory allocated by this program: %.2f MB\n", used_mb);
     //**************************||**************************************//
     
     for (int epoch = 1; epoch <= epochs; ++epoch) {
