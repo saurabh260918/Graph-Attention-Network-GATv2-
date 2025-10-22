@@ -17,52 +17,7 @@
 #include <thrust/host_vector.h>
 #include <thrust/device_ptr.h>
 #include <thrust/reduce.h>
-//# define SLOT_SIZE 64
 
-
-// including gradient_clip
-
-double compute_gradient_norm(const double* grad_array, size_t size) {
-    double sum_squares = 0.0;
-    for (size_t i = 0; i < size; ++i) {
-        sum_squares += grad_array[i] * grad_array[i];
-    }
-    return sqrt(sum_squares);
-}
-
-//------------------------------to copy initalised weights as text file----------------------------//
-
-//======================TEMPORARY START====================//
-void load_float_array(const std::string& filename, float** arr, int& length) {
-    std::ifstream file(filename);
-    std::vector<float> values;
-    float val;
-    while (file >> val) {
-        values.push_back(val);
-    }
-    length = values.size();
-    *arr = new float[length];
-    std::copy(values.begin(), values.end(), *arr);
-}
-
-//=====================TEMPORARY END====================
-
-void save_array_to_file(const std::string& filename, const float* array, int size) {
-    std::ofstream file(filename);
-    if (!file.is_open()) {
-        std::cerr << "Error: Could not open file " << filename << " for writing" << std::endl;
-        return;
-    }
-
-    for (int i = 0; i < size; ++i) {
-        file << array[i];
-        if (i < size - 1) file << " ";  // Space between numbers, no space after last
-    }
-    file << std::endl;
-    file.close();
-
-    std::cout << "Saved " << size << " values to " << filename << std::endl;
-}
 
 //------------------------------END---------------------------------------------------------------//
 
@@ -455,15 +410,15 @@ __global__ void aggregate_kernel(
     const float* w_h = d_w + h * (out_dim * 2 * in_dim);              // [out_dim, 2*in_dim]
     const float* x_src = d_in_feat + src * in_dim;              // [in_dim]
     float* out_dst_h = d_out_feat + ((dst * H + h) * out_dim);  // [out_dim]
-    const float* w_h_right;
+    const float* w_h_left;
 
 
     // accumulate contribution into dst node’s output
     for (int k = 0; k < out_dim; ++k) {
         float sum = 0.0f;
-        w_h_right = w_h + k * (2 * in_dim) + in_dim; // [2*in_dim] row k of W_h
+        w_h_left = w_h + k * (2 * in_dim); // [2*in_dim] row k of W_h
         for (int j = 0; j < in_dim; ++j) {
-            sum += w_h_right[j] * x_src[j];
+            sum += w_h_left[j] * x_src[j];
         }
         sum *= alpha;
         atomicAdd(&out_dst_h[k], sum);
@@ -589,11 +544,11 @@ float compute_loss_and_accuracy(int N, float* d_loss, int* d_correct) {
     thrust::device_ptr<int> dev_corrects(d_correct);
     float total_loss = thrust::reduce(dev_losses, dev_losses + N, 0.0f, thrust::plus<float>());
     int total_correct = thrust::reduce(dev_corrects, dev_corrects + N, 0, thrust::plus<int>());
-    // float avg_loss = total_loss / N;
+    float avg_loss = total_loss / N;
     float loss = total_loss;
     float accuracy = static_cast<float>(total_correct) / N;
-    // printf("\nAvg Loss: %f, Accuracy: %.2f%%\n", avg_loss, 100.0f * accuracy);
-    printf("\nLoss: %f, Accuracy: %.2f%%\n", loss, 100.0f * accuracy);
+    printf("\nAvg Loss: %f, Accuracy: %.2f%%\n", avg_loss, 100.0f * accuracy);
+    // printf("\nLoss: %f, Accuracy: %.2f%%\n", loss, 100.0f * accuracy);
     return loss;
 }
 
@@ -679,12 +634,12 @@ __global__ void kernel_grad_atten_coeff(
     // loop over heads
     for (int h = 0; h < num_heads; ++h) {
         const float* W_head = d_w + h * out_dim * (2 * in_dim);  // W for head h
-        const float* W_right = W_head + in_dim;
+        const float* W_left = W_head;
         float tmp_vec = 0.0f;
         for (int d = 0; d < out_dim; ++d) {
             float Wxi_d = 0.0f;
             for (int k = 0; k < in_dim; ++k) {
-                Wxi_d += W_right[d * (2 * in_dim) + k] * features[i * in_dim + k];
+                Wxi_d += W_left[d * (2 * in_dim) + k] * features[i * in_dim + k];
             }
             // dot with grad_input[i, h, :]
             float gj = grad_input[(j * num_heads + h) * out_dim + d];
@@ -748,7 +703,7 @@ __global__ void compute_grad_parameters_kernel(
     int H,
     int* __restrict__ d_src,               // [E]
     int* __restrict__ d_dst,               // [E]
-    float* __restrict__ d_features,        // [N][H][in_dim]      //input features to this layer.
+    float* __restrict__ d_features,        // [N][in_dim]      //input features to this layer.
     float* __restrict__ d_input_gradients, // [N][H][out_dim]   //gradient flowing from upper layer to this layer. act as input gradient to this layer.
     float* __restrict__ d_grad_attn_score, // [H][E]
     float* __restrict__ d_attn_coeff,      // [H][E]
@@ -811,13 +766,13 @@ __global__ void compute_grad_parameters_kernel(
             if (s_k > 0)
                 leaky_s_k = s_k;
             else
-                leaky_s_k = s_k * negative_slope; // assuming negative_slope = 0.2
+                leaky_s_k = s_k * negative_slope;
             // sh_grad_a[k] += dl_de * leakyRelu(s_k) 
             //but each thread is writing to same location. so use atomic add
             atomicAdd(&sh_grad_a[k], dl_de * leaky_s_k);
             float grad_dst_k = grad_dst[k]; // ∂L/∂h_j^{h}[k]
             for(int i=0; i<in_dim; i++){
-                atomicAdd(&sh_grad_w[in_dim + i], grad_dst_k * alpha_ij * x_src[i]);
+                atomicAdd(&sh_grad_w[i], grad_dst_k * alpha_ij * x_src[i]);
             }
             float derivative = (s_k > 0.0f) ? 1.0f : negative_slope;
             float common_term = dl_de * sh_a[k] * derivative;
@@ -842,10 +797,9 @@ __global__ void compute_grad_parameters_kernel(
         }
         __syncthreads();
     }
-    // if(e == E-1)
-    //     printf("compute_grad_parameters_kernel success\n");
     
 }
+
 
 __global__ void compute_features_input_gradients(
     int N,
@@ -854,11 +808,11 @@ __global__ void compute_features_input_gradients(
     int in_dim,
     int out_dim,
     float negative_slope,
-    const int* src_idx,            // [E]
-    const int* dst_idx,            // [E]
-    const float* attn_coeff,          // [H][E]
+    const int* src_idx,                // [E]
+    const int* dst_idx,                // [E]
+    const float* attn_coeff,           // [H][E]
     const float* input_features,      // [N][in_dim]
-    const float* d_w,                 // [H][out_dim][2*in_dim]
+    const float* d_w,             // [H][out_dim][2*in_dim]
     const float* d_input_gradients,   // [N][H][out_dim]     //gradient flowing from upper layer to this layer. act as input gradient to this layer.
     const float* grad_attn_score,     // [H][E]
     const float* attn_vector,         // [H][out_dim]
@@ -869,17 +823,10 @@ __global__ void compute_features_input_gradients(
     if(edge_id >= E) return;
     int src = src_idx[edge_id];
     int dst = dst_idx[edge_id];
-    // allocate per thread array of size 128
-    const int SLOT_SIZE = 64;
-    float grad_local_src[SLOT_SIZE] = {0};
-    float grad_local_dst[SLOT_SIZE] = {0};
-    int num_slots = (in_dim + SLOT_SIZE - 1) / SLOT_SIZE;
-    // allocate shared memory for attn_vector
     extern __shared__ float shmem[]; // size: out_dim
     float* sh_a = &shmem[0];          // [size: out_dim]
     // loop over heads
-    // if(edge_id == 0)
-    //     printf("compute_features_input_gradients started\n");
+
     for (int h = 0; h < H; ++h) {
         const float* a_h = attn_vector + h * out_dim;                        // [out_dim]
         //fill sh_a from a_h using multiple threads
@@ -887,7 +834,7 @@ __global__ void compute_features_input_gradients(
             sh_a[i] = a_h[i];
         }
         __syncthreads();
-        const float* W_h = d_w + h * out_dim * (2 * in_dim);         // [out_dim][2*in_dim]
+        int base = h * out_dim * 2 * in_dim;         // [out_dim][in_dim]
         float  dl_de = grad_attn_score[h * E + edge_id];                 // ∂L/∂e_{ij}^{h}
         float  alpha_ij = attn_coeff[h * E + edge_id];                   // α_{ij}^{h}
         const float* x_src = input_features + (src * in_dim);    // x_i
@@ -895,56 +842,38 @@ __global__ void compute_features_input_gradients(
         const float* grad_dst = d_input_gradients + (dst * H + h) * out_dim; // ∂L/∂h_j^{h}
         float* grad_x_src = grad_x_features + (src * in_dim); // ∂L/∂x_i
         float* grad_x_dst = grad_x_features + (dst * in_dim); // ∂L/∂x_j
-        // loop over slots
-        for (int slot = 0; slot < num_slots; ++slot) {
-            int slot_start = slot * SLOT_SIZE;
-            int slot_end = min(slot_start + SLOT_SIZE, in_dim);
-            for(int k = 0; k< out_dim; k++){
-                // compute s_k = W_left[k]·x_src + W_right[k]·x_dst
-                const float* W_row = W_h + (size_t)k * (size_t)(2 * in_dim); // length 2*in_dim
-                float s_k = 0.0f;
-                // left part (src)
-                for (int q = 0; q < in_dim; ++q) {
-                    s_k += W_row[q] * x_src[q];
-                }
-                // right part (dst)
-                for (int q = 0; q < in_dim; ++q) {
-                    s_k += W_row[in_dim + q] * x_dst[q];
-                }
-                float leaky_s_k;
-                if (s_k > 0)
-                    leaky_s_k = s_k;
-                else
-                    leaky_s_k = s_k * negative_slope;
-                float derivative = (s_k > 0.0f) ? 1.0f : negative_slope;
-                float common_term = dl_de * sh_a[k] * derivative;  // common term for src and dst node feature gradients contribution.
-                float grad_dst_k = grad_dst[k]; // ∂L/∂h_j^{h}[k]
-                // compute src node feature gradients contribution for this slot
-                for (int i = slot_start; i < slot_end; ++i) {
-                    //contribute from direct path through aggregation
-                    grad_local_src[i - slot_start] += grad_dst_k * alpha_ij * W_row[in_dim + i];   // right part of W_row
-                    //contribution from attention score path
-                    if(src == dst){
-                        grad_local_src[i - slot_start] += common_term * W_row[i]; // left part of W_row
-                    }
-                    else {
-                        grad_local_src[i - slot_start] += common_term * W_row[i];
-                        grad_local_dst[i - slot_start] += common_term * W_row[in_dim + i];   //right part of W_row
-                    }
-                }
+        // here each thread working on each edge will compute the contribution to input feature gradient of src and dst node
+        // loop over output dimension
+        const float* d_w_h = d_w + base;               // W_src part
+        for (int od = 0; od < out_dim; ++od) {
+            // Compute S_ij^{h}[od] = W_src[od,:] * xi + W_dst[od,:] * xj (on-the-fly)
+            float sij_od = 0.0f;
+            for (int id = 0; id < in_dim; ++id) {
+                float w_src_od_id = d_w_h[od * 2 * in_dim + id];
+                float w_dst_od_id = d_w_h[od * 2 * in_dim + id + in_dim];
+                sij_od += w_src_od_id * x_src[id];
+                sij_od += w_dst_od_id * x_dst[id];
             }
-            // after computing contributions for this slot, add them to grad_x_features using atomic add
-            for (int i = slot_start; i < slot_end; ++i) {
-                atomicAdd(&grad_x_src[i], grad_local_src[i - slot_start]);
-                atomicAdd(&grad_x_dst[i], grad_local_dst[i - slot_start]);
-                // reset for next slot
-                grad_local_src[i - slot_start] = 0.0f;
-                grad_local_dst[i - slot_start] = 0.0f;
+            // Compute Leaky'(S_ij^{h}[od]) on the-fly
+            float leaky_prime_sij_od = (sij_od > 0.0f) ? 1.0f : negative_slope;
+            // Compute a^h[od] ⊙ Leaky'(S_ij^{h}[od])
+            float a_leaky_prime = sh_a[od] * leaky_prime_sij_od;
+            // Contribution to ∂L/∂x_i (src node)
+            for (int id = 0; id < in_dim; ++id) {
+                // Direct path contribution ∂L/∂x_src|_direct = Σ_h [∂L/∂h_dst^{h} · α_ij^{h} · W_src[:,id]]
+                // Attention path contribution ∂L/∂x_src|_atten = Σ_h (∂L/∂e_ij^{h} [a^h ⊙ Leaky'(S_ij^{h})] · W_src[:,id])
+                // Attention path contribution ∂L/∂x_dst = Σ_h (∂L/∂e_ij^{h} [a^h ⊙ Leaky'(S_ij^{h})] · W_dst[:,id])
+                float w_src_od_id = d_w_h[od * 2 * in_dim + id];
+                float w_dst_od_id = d_w_h[od * 2 * in_dim + in_dim + id];
+                float contrib_x_src = grad_dst[od] * alpha_ij * w_src_od_id
+                                    + dl_de * a_leaky_prime * w_src_od_id;
+                float contrib_x_dst = dl_de * a_leaky_prime * w_dst_od_id;
+                atomicAdd(&grad_x_src[id], contrib_x_src);
+                atomicAdd(&grad_x_dst[id], contrib_x_dst);
             }
+
         }
     }
-    // if(edge_id == E-1)
-    //     printf("compute_features_input_gradients success\n");
 }
 
 // now i have gradient of input feature for each node. this i will pass through activation function 
@@ -952,47 +881,44 @@ __global__ void compute_features_input_gradients(
 // as input gradient to previous layer.
 __global__ void compute_preActivation_inputFeatures_gradient(
     int N,
-    int H,
     float negative_slope,
     int in_dim,
-    const float* pre_activation_input_features, // [N][H][in_dim], input features before activation
-    float* input_features_gradients // [N][H][in_dim], gradient of input features after activation
+    const float* pre_activation_input_features, // [N][in_dim], input features before activation
+    float* input_features_gradients // [N][in_dim], gradient of input features after activation
 ) {
     int nodeId = blockIdx.x * blockDim.x + threadIdx.x;
     if (nodeId >= N) return;
-    for(int h=0; h<H; h++){
-        for(int d=0; d<in_dim; d++){
-            float post_activation_gradients = input_features_gradients[(nodeId * H + h) * in_dim + d];
-            float derivative = (pre_activation_input_features[(nodeId * H + h) * in_dim + d] > 0.0f) ? 1.0f : negative_slope;
-            input_features_gradients[(nodeId * H + h) * in_dim + d] = post_activation_gradients * derivative;
-        }
+    for(int d=0; d<in_dim; d++){
+            float post_activation_gradients = input_features_gradients[(nodeId * in_dim + d)];
+            float derivative = (pre_activation_input_features[(nodeId * in_dim + d)] > 0.0f) ? 1.0f : negative_slope;
+            input_features_gradients[(nodeId * in_dim + d)] = post_activation_gradients * derivative;
     }
-    // if(nodeId == N-1)
-    //     printf("compute_preActivation_inputFeatures_gradient success\n");
 }
 
 
-// __global__ void adam_update_kernel(
-//     float* params, const double* grads, float* m, float* v,
-//     float lr, size_t n, float beta1, float beta2, float epsilon, int t) {
-//     int i = blockIdx.x * blockDim.x + threadIdx.x;
-//     if (i < n) {
-//         // Update biased first moment estimate
-//         m[i] = beta1 * m[i] + (1.0f - beta1) * (float)grads[i];
+__global__ void adam_update_kernel(
+    float* params, const float* grads, float* m, float* v,
+    float lr, size_t n, float beta1, float beta2, float epsilon, int t) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        // Update biased first moment estimate
+        m[i] = beta1 * m[i] + (1.0f - beta1) * grads[i];
 
-//         // Update biased second raw moment estimate
-//         v[i] = beta2 * v[i] + (1.0f - beta2) * ((float)grads[i] * (float)grads[i]);
+        // Update biased second raw moment estimate
+        v[i] = beta2 * v[i] + (1.0f - beta2) * (grads[i] * grads[i]);
 
-//         // Compute bias-corrected first moment estimate
-//         float m_hat = m[i] / (1.0f - powf(beta1, t));
+        // Compute bias-corrected first moment estimate
+        float m_hat = m[i] / (1.0f - powf(beta1, t));
 
-//         // Compute bias-corrected second raw moment estimate
-//         float v_hat = v[i] / (1.0f - powf(beta2, t));
+        // Compute bias-corrected second raw moment estimate
+        float v_hat = v[i] / (1.0f - powf(beta2, t));
 
-//         // Update parameters
-//         params[i] -= lr * m_hat / (sqrtf(v_hat) + epsilon);
-//     }
-// }
+        // Update parameters
+        params[i] -= lr * m_hat / (sqrtf(v_hat) + epsilon);
+    }
+}
+
+
 __global__ void sgd_update_kernel(float* params, float* grads, float lr, size_t n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n)
@@ -1001,20 +927,157 @@ __global__ void sgd_update_kernel(float* params, float* grads, float lr, size_t 
 
 
 
-int main() {
+int main(int argc, char** argv) {
+    // Default hyperparameters
+    int epochs = 200;
+    int L = 2;
+    bool clip = false;
+    std::string optimizer = "sgd";
+    float lr = 0.0001f, beta1 = 0.9f, beta2 = 0.999f;
+    bool beta1_specified = false, beta2_specified = false;
+
+    // Parse command-line args to get L first
+    for (int i = 1; i < argc; i++) {
+        std::string arg = argv[i];
+        if (arg == "--num-layers" && i + 1 < argc) {
+            L = std::stoi(argv[++i]);
+            if (L <= 0) {
+                std::cerr << "Error: Number of layers must be > 0\n";
+                return 1;
+            }
+            break;
+        }
+    }
+    int* head       = new int[L];
+    int* out_dim    = new int[L];
+    
+    // Parse command line arguments
+    for (int i = 1; i < argc; i++) {
+        std::string arg = argv[i];
+        
+        if (arg == "--epochs" && i + 1 < argc) {
+            epochs = std::stoi(argv[++i]);
+        }
+        else if (arg == "--heads" && i + 1 < argc) {
+            std::string val = argv[++i];
+            std::stringstream ss(val);
+            std::string item;
+            for (int l = 0; l < L; ++l) {
+                if (!std::getline(ss, item, ',')) {
+                    std::cerr << "Error: --heads must have " << L << " values.\n";
+                    return 1;
+                }
+                head[l] = std::stoi(item);
+            }
+        }
+        else if (arg == "--outdims" && i + 1 < argc) {
+            std::string val = argv[++i];
+            std::stringstream ss(val);
+            std::string item;
+            for (int l = 0; l < L; ++l) {
+                if (!std::getline(ss, item, ',')) {
+                    std::cerr << "Error: --ooutdims must have " << L << " values.\n";
+                    return 1;
+                }
+                out_dim[l] = std::stoi(item);
+            }
+        }
+        else if (arg == "--clip") {
+            clip = true;
+        }
+        else if (arg == "--optimizer" && i + 1 < argc) {
+            optimizer = argv[++i];
+            if(optimizer != "sgd" && optimizer != "adam") {
+                std::cerr << "Invalid optimizer choice. Use 'sgd' or 'adam'\n";
+                return 1;
+            }
+        }
+        // Parse args (optional)
+        else if (arg == "--beta1" && i + 1 < argc){
+            beta1 = std::stof(argv[++i]);
+            beta1_specified = true;
+        }
+        else if (arg == "--beta2" && i + 1 < argc) {
+            beta2 = std::stof(argv[++i]);
+            beta2_specified = true;
+        }
+        else if (arg == "--lr" && i + 1 < argc) {
+            lr = std::stof(argv[++i]);
+        }
+    }
+    if (optimizer == "adam") {
+        if (beta1 <= 0.0f || beta1 >= 1.0f || beta2 <= 0.0f || beta2 >= 1.0f) {
+            std::cerr << "Error: For Adam optimizer, beta1 and beta2 must be in (0,1).\n";
+            return 1;
+        }
+    } else if (optimizer == "sgd") {
+            if (beta1_specified || beta2_specified) {
+                std::cerr << "Warning: beta1/beta2 specified but ignored for SGD optimizer.\n";
+            }
+    }
+
+
+    // Print configuration
+    std::cout << "Configuration:\n"
+              << "  Number of layers: " << L << "\n"
+              << "  Epochs: " << epochs << "\n"
+              << "  Attention heads: [";
+    for (int l = 0; l < L; ++l) {
+        std::cout << head[l];
+        if (l < L-1) std::cout << ", ";
+    }
+    std::cout << "]\n  Output dimensions: [";
+    for (int l = 0; l < L; ++l) {
+        std::cout << out_dim[l];
+        if (l < L-1) std::cout << ", ";
+    }
+    std::cout << "]\n"
+              << "  Gradient clipping: " << (clip ? "true" : "false") << "\n"
+              << "  Optimizer: " << optimizer << "\n"
+              << "  Learning rate: " << lr << "\n\n";
+
     // 1. Load graph in CSR format
     int num_nodes, num_edges, input_dim;
     float* h_features;    // [num_nodes][input_dim]
     int* h_row_ptr;       // [num_nodes+1]
     int* h_col_idx;       // [num_edges]
     int* h_labels;       // [num_nodes]
-   
-     // Load features
-    load_features("/kaggle/input/archive/features.txt", &h_features, num_nodes, input_dim);
+
+    // Load features
+    std::string dataset_name = "pubmed";
+    std::string data_root = "./data";
+    // Parse command-line arguments
+    for (int i = 1; i < argc; i++) {
+        std::string arg = argv[i];
+        if (arg == "--dataset" && i + 1 < argc) {
+            dataset_name = argv[++i];
+        } 
+        else if (arg == "--data-root" && i + 1 < argc) {
+            data_root = argv[++i];
+        }
+    }
+
+    // Fallback: check environment variable (used if --data-root not provided)
+    const char* env_root = std::getenv("DATA_ROOT");
+    if (env_root && data_root == "./data") { // only override if user didn't pass CLI flag
+        data_root = std::string(env_root);
+    }
+
+    // Ensure trailing slash
+    if (!data_root.empty() && data_root.back() != '/' && data_root.back() != '\\')
+        data_root += '/';
+
+    std::string dataset_path = data_root + dataset_name + "/";
+
+
+    std::cout << "Using dataset: " << dataset_name << std::endl;
+    std::cout << "Dataset path: " << dataset_path << std::endl;
+
+    load_features((dataset_path + "features.txt").c_str(), &h_features, num_nodes, input_dim);
 
     // Load row_ptr
     int row_ptr_len;
-    load_int_array("/kaggle/input/archive/row_ptr.txt", &h_row_ptr, row_ptr_len);
+    load_int_array((dataset_path + "row_ptr.txt").c_str(), &h_row_ptr, row_ptr_len);
     if (row_ptr_len != num_nodes + 1) {
         std::cerr << "Invalid row_ptr length\n";
         return 1;
@@ -1022,31 +1085,31 @@ int main() {
 
     // Load col_idx
     int col_idx_len;
-    load_int_array("/kaggle/input/archive/col_idx.txt", &h_col_idx, col_idx_len);
+    load_int_array((dataset_path + "col_idx.txt").c_str(), &h_col_idx, col_idx_len);
     num_edges = col_idx_len;
 
     //load labels
     int labels_len;
-    load_int_array("/kaggle/input/archive/labels.txt", &h_labels, labels_len);
+    load_int_array((dataset_path + "labels.txt").c_str(), &h_labels, labels_len);
     if (labels_len != num_nodes) {
         std::cerr << "Invalid labels length\n";
         return 1;
     }
+    //=======================================================================================//
 
     int max_degree = compute_max_degree(h_row_ptr, num_nodes);
     std::cout << "Max degree = " << max_degree << std::endl;
 
     auto itr = thrust::max_element(thrust::host, h_labels, h_labels + num_nodes);
     int C = *itr + 1; // Number of classes, assuming labels are 0-indexed
-    std::cout<<"num classes: " << C<<std::endl;
+    std::cout << "Number of classes = " << C << std::endl;
 
-     // 2. Define GATv2 architecture
-    const int L = 2; // Example: 5 layers
-    //int C = 7; // C class classification problem.
-    int head[L] = {4, 1};         // Number of heads per layer
-    int out_dim[L] = {64, 32};    // Output dim per head per layer
+    std::cout << "Graph loaded: " << num_nodes << " nodes, " << num_edges << " edges, "
+              << "input_feature_vector_dim = " << input_dim << std::endl;
 
-    int in_dim[L]= {input_dim}; // Input dim for first layer, subsequent layers will be computed based on previous layer's output.
+
+
+    int* in_dim = new int[L]; // Input dim for first layer, subsequent layers will be computed based on previous layer's output.
     in_dim[0] = input_dim;
     for (int l = 1; l < L; ++l)
         in_dim[l] = head[l-1] * out_dim[l-1];
@@ -1062,15 +1125,15 @@ int main() {
     int* d_row_ptr;    // Device CSR row pointer
     int* d_col_idx;    // Device CSR edge array
     int* d_labels;     // Device labels array
-    float* d_layer_outputs[L]; // Output buffers per layer
-    float* d_h[L];       // pre-nonlinearity output of hidden layers
+    float** d_layer_outputs = new float*[L]; // Output buffers per layer
+    float** d_h = new float*[L];       // pre-nonlinearity output of hidden layers
     float* d_wo;       // Device linear transformation weight matrix of size C X out_dim.
     float* d_z;        // output after linear transformation. size is number of nodes X C.
     float* d_y;        // output probabilities [N][C]
-    float* attn_score[L]; // Attention scores per layer [N][num_heads][max_degree]
-    float* attn_coeff[L]; // Attention coefficients per layer [N][num_heads][max_degree]
-    float* d_leakyrelu[L]; // LeakyReLU outputs per layer
-    float* d_s[L];        // pre-nonlinearity output of each edge per layer
+    float** attn_score = new float*[L]; // Attention scores per layer [N][num_heads][max_degree]
+    float** attn_coeff = new float*[L]; // Attention coefficients per layer [N][num_heads][max_degree]
+    float** d_leakyrelu = new float*[L]; // LeakyReLU outputs per layer
+    float** d_s = new float*[L];        // pre-nonlinearity output of each edge per layer
     float* grad_wo;    // [C][out_dim_last_layer]
     float* grad_d_w;   // [total_w]
     float* grad_d_a;   // [total_a]
@@ -1112,7 +1175,7 @@ int main() {
     int* d_dst;
     cudaMalloc(&d_src, num_edges * sizeof(int));
     cudaMalloc(&d_dst, num_edges * sizeof(int));
-    printf("\nsize of graph data (CSR,COO, labels) : %zu MB\n", (((num_nodes+1) + num_edges + num_nodes + 2* num_edges)* sizeof(int)) / (1024 * 1024));
+    printf("\nsize of graph data (CSR,COO, labels) : %zu KB\n", (((num_nodes+1) + num_edges + num_nodes + 2* num_edges)* sizeof(int)) / (1024));
 
     int threads = 256;
     int blocks = (num_nodes + threads - 1) / threads;
@@ -1152,30 +1215,6 @@ int main() {
     }
     printf("Total size of attention scores & coeffs: %zu MB\n", ((2*total_heads* num_edges * sizeof(float)) / (1024 * 1024)));
 
-    //========================CREATE HOST MEMORY FOR DEBUG PURPOSE===========================
-    // //temporary create memories for h_s[l], h_attn_score[l]
-    // float* h_s[L];
-    float* h_attn_score[L];
-    float* h_attn_coeff[L];
-    float* h_layer_outputs[L];
-    float* h_h[L];
-    for (int l = 0; l < L; ++l) {
-    //     h_s[l] = (float*)malloc(num_nodes * head[l] * max_degree * out_dim[l] * sizeof(float));
-        h_attn_score[l] = (float*)malloc(num_edges * head[l] * sizeof(float));
-        h_attn_coeff[l] = (float*)malloc(num_edges * head[l] * sizeof(float));
-
-        size_t output_size;
-        if (l == L - 1) {
-            // Last layer: average heads, only out_dim[l] per node
-            output_size = num_nodes * out_dim[l];
-        } else {
-            // Non-last layer: concatenate heads
-            output_size = num_nodes * head[l] * out_dim[l];
-        }
-
-        h_layer_outputs[l] = (float*)malloc(output_size * sizeof(float));
-        h_h[l] = (float*)malloc(output_size * sizeof(float));
-    }
     //==========================////////////============================================================
 
     err = cudaMalloc(&d_head, L * sizeof(int));
@@ -1198,8 +1237,10 @@ int main() {
 
     // Compute total size needed for all layers
     size_t total_w = 0, total_a = 0;
-    int w_offset[L]= {0}; // Offsets for weights
-    int a_offset[L]= {0}; // Offsets for attention vectors
+    int* w_offset = new int[L];
+    int* a_offset = new int[L];
+    w_offset[0]= 0; // Offsets for weights
+    a_offset[0]= 0; // Offsets for attention vectors
     for (int l = 1; l < L; ++l) {
         w_offset[l] = w_offset[l-1] + head[l-1] * out_dim[l-1] * 2 * in_dim[l-1];
         a_offset[l] = a_offset[l-1] + head[l-1] * out_dim[l-1];
@@ -1228,27 +1269,27 @@ int main() {
     int max_out_dim = *std::max_element(out_dim, out_dim + L); // Maximum output dimension across all layers
 
     //=============INITIALISE ADAM PARAMETERS========================
-    // float *m_w;
-    // cudaMalloc(&m_w, total_w * sizeof(float));
-    // cudaMemset(m_w, 0, total_w * sizeof(float));
-    // float *v_w;
-    // cudaMalloc(&v_w, total_w * sizeof(float));
-    // cudaMemset(v_w, 0, total_w * sizeof(float));
+    float *m_w;
+    cudaMalloc(&m_w, total_w * sizeof(float));
+    cudaMemset(m_w, 0, total_w * sizeof(float));
+    float *v_w;
+    cudaMalloc(&v_w, total_w * sizeof(float));
+    cudaMemset(v_w, 0, total_w * sizeof(float));
 
-    // float *m_a;
-    // cudaMalloc(&m_a, total_a * sizeof(float));
-    // cudaMemset(m_a, 0, total_a * sizeof(float));
-    // float *v_a;
-    // cudaMalloc(&v_a, total_a * sizeof(float));
-    // cudaMemset(v_a, 0, total_a * sizeof(float));
+    float *m_a;
+    cudaMalloc(&m_a, total_a * sizeof(float));
+    cudaMemset(m_a, 0, total_a * sizeof(float));
+    float *v_a;
+    cudaMalloc(&v_a, total_a * sizeof(float));
+    cudaMemset(v_a, 0, total_a * sizeof(float));
 
-    // int total_wo = C * out_dim[L - 1];
-    // float *m_wo;
-    // cudaMalloc(&m_wo, total_wo * sizeof(float));
-    // cudaMemset(m_wo, 0, total_wo * sizeof(float));
-    // float *v_wo;
-    // cudaMalloc(&v_wo, total_wo * sizeof(float));
-    // cudaMemset(v_wo, 0, total_wo * sizeof(float));
+    int total_wo = C * out_dim[L - 1];
+    float *m_wo;
+    cudaMalloc(&m_wo, total_wo * sizeof(float));
+    cudaMemset(m_wo, 0, total_wo * sizeof(float));
+    float *v_wo;
+    cudaMalloc(&v_wo, total_wo * sizeof(float));
+    cudaMemset(v_wo, 0, total_wo * sizeof(float));
 
     //===============INITIALISE XAVIER WEIGHTS================================================================
     // 3. Initialize weights and attention vectors using Xavier initialization
@@ -1258,7 +1299,7 @@ int main() {
     cudaMalloc(&d_states, nthreads * sizeof(curandState));
     int blockSize = 128;
     dim3 gridSize((nthreads + blockSize - 1) / blockSize);
-    setup_states_kernel<<<gridSize, blockSize>>>(d_states, 12345);
+    setup_states_kernel<<<gridSize, blockSize>>>(d_states, time(NULL));
     cudaDeviceSynchronize();
     // Check for errors
     err = cudaGetLastError();
@@ -1278,110 +1319,7 @@ int main() {
         fprintf(stderr, "Error launching xavier_init_kernel: %s\n", cudaGetErrorString(err));
     }
 
-    //-------------------------------------COPY INITIAL WEIGHTS TO HOST----------------------------------------------------
-
-    // //Copy weights from device to host for saving
-    // float* h_w = new float[total_w];
-    // float* h_a = new float[total_a];
-    // float* h_wo = new float[C * out_dim[L-1]];
-
-    // cudaMemcpy(h_w, d_w, total_w * sizeof(float), cudaMemcpyDeviceToHost);
-    // cudaMemcpy(h_a, d_a, total_a * sizeof(float), cudaMemcpyDeviceToHost);
-    // cudaMemcpy(h_wo, d_wo, C * out_dim[L-1] * sizeof(float), cudaMemcpyDeviceToHost);
-    // // //now print these parameters in matrix form for each layer
-    // // for (int l = 0; l < L; ++l) {
-    // //     printf("\nLayer %d:\n", l);
-    // //     printf("\nWeight matrix (d_w):\n");
-    // //     for (int od = 0; od < out_dim[l]; ++od) {
-    // //         for (int id = 0; id < 2 * in_dim[l]; ++id) {
-    // //             printf("%f ", h_w[(l * 1 + 0) * out_dim[l] * 2 * in_dim[l] + od * 2 * in_dim[l] + id]);
-    // //         }
-    // //         printf("\n");
-    // //     }
-    // //     printf("\nAttention vector (d_a):\n");
-    // //     for (int od = 0; od < out_dim[l]; ++od) {
-    // //         printf("%f ", h_a[(l * 1 + 0) * out_dim[l] + od]);
-    // //     }
-    // //     printf("\n");
-    // // }
-    // // printf("\nTransformation weight matrix (d_wo):\n");
-    // // for (int r = 0; r < C; ++r) {
-    // //     for (int od = 0; od < out_dim[L - 1]; ++od) {
-    // //         printf("%f ", h_wo[r * out_dim[L - 1] + od]);
-    // //     }
-    // //     printf("\n");
-    // // }
-
-    //  // Save weights to files
-    // save_array_to_file("weights_w.txt", h_w, total_w);
-    // save_array_to_file("weights_a.txt", h_a, total_a);
-    // save_array_to_file("weights_wo.txt", h_wo, C * out_dim[L-1]);
-
-    // // Clean up host memory
-    // delete[] h_w;
-    // delete[] h_a;
-    // delete[] h_wo;
-
-    // std::cout << "Weights saved successfully!" << std::endl;
-
-    //--------TOY WEIGHTS---------------------------------------------------
-
-    // //load weights from txt files manually (not using xavier kernel weights)
-    // float* h_w;
-    // float* h_a;
-    // float* h_wo;
-
-    // //load weights
-    // int weights_w_len;
-    // load_float_array("/kaggle/input/4nodes-weights/weights_w.txt", &h_w, weights_w_len);
-    // if (weights_w_len != total_w) {
-    //     std::cerr << "Invalid weights_w length\n";
-    //     return 1;
-    // }
-
-    // int weights_a_len;
-    // load_float_array("/kaggle/input/4nodes-weights/weights_a.txt", &h_a, weights_a_len);
-    // if (weights_a_len != total_a) {
-    //     std::cerr << "Invalid weights_a length\n";
-    //     return 1;
-    // }
-
-    // int weights_wo_len;
-    // load_float_array("/kaggle/input/4nodes-weights/weights_wo.txt", &h_wo, weights_wo_len);
-    // if (weights_wo_len != C * out_dim[L-1]) {
-    //     std::cerr << "Invalid weights_wo length\n";
-    //     return 1;
-    // }
-
-    // //print h_w in matrix form
-    // printf("\nWeights w:\n");
-    // for (int l = 0; l < L; ++l) {
-    //     printf("Layer %d:\n", l);
-    //     for (int od = 0; od < out_dim[l]; ++od) {
-    //         for (int id = 0; id < 2 * in_dim[l]; ++id) {
-    //             printf("%f ", h_w[w_offset[l] + od * 2 * in_dim[l] + id]);
-    //         }
-    //         printf("\n");
-    //     }
-    // }
-    // cudaMemcpy(d_w, h_w, total_w * sizeof(float), cudaMemcpyHostToDevice);
-    // err = cudaGetLastError();
-    // if (err != cudaSuccess) {
-    //     fprintf(stderr, "Error copying weights_w to device: %s\n", cudaGetErrorString(err));
-    // }
-
-    // cudaMemcpy(d_a, h_a, total_a * sizeof(float), cudaMemcpyHostToDevice);
-    // err = cudaGetLastError();
-    // if (err != cudaSuccess) {
-    //     fprintf(stderr, "Error copying weights_a to device: %s\n", cudaGetErrorString(err));
-    // }
-    // cudaMemcpy(d_wo, h_wo, C * out_dim[L-1] * sizeof(float), cudaMemcpyHostToDevice);
-    // err = cudaGetLastError();
-    // if (err != cudaSuccess) {
-    //     fprintf(stderr, "Error copying weights_wo to device: %s\n", cudaGetErrorString(err));
-    // }
-
-    //------------------------------------------------------------------------------//
+    
 
     float* d_loss;      // [num_nodes]
     int*   d_correct;   // [num_nodes]
@@ -1415,10 +1353,9 @@ int main() {
     cudaMalloc(&d_max_attn_score, max_size);
     cudaMalloc(&d_sum_score_exp, max_size);
 
-    //**************************||************************************//
     //**************************||**************************************//
     
-    for (int epoch = 1; epoch <= 30; ++epoch) {
+    for (int epoch = 1; epoch <= epochs; ++epoch) {
         auto start = std::chrono::high_resolution_clock::now();
         printf("\nEpoch %d\n", epoch);
         // b. Forward pass for each layer
@@ -1486,84 +1423,8 @@ int main() {
             d_layer_inputs = d_layer_outputs[l];
 
 
-            //=======================================PRINT FORWARD PASS OUTPUS START HERE============================
-            //print attn_score
-            // cudaMemcpy(h_attn_score[l], attn_score[l], head[l] * num_edges * sizeof(float), cudaMemcpyDeviceToHost);
-            // for (int h = 0; h < head[l]; ++h) {
-            //     //printf("\nHead %d:\n", h);
-            //     for (int dst = 0; dst < num_nodes; ++dst) {
-            //         int row_start = h_row_ptr[dst];
-            //         int row_end = h_row_ptr[dst + 1];
-            //         for (int e = row_start; e < row_end; ++e) {
-            //             int src = h_col_idx[e];
-            //             float score = h_attn_score[l][h * num_edges + e];
-            //             printf("Edge (%d -> %d): %f\n", src, dst, score);
-            //         }
-            //     }
-            // }
-
-            // copy attn_score from device to host
-            // cudaMemcpy(h_attn_coeff[l], attn_coeff[l], head[l]*num_edges * sizeof(float), cudaMemcpyDeviceToHost);
-            // printf("\nAttention coefficients:\n");
-            // for (int h = 0; h < head[l]; ++h) {
-            //     printf("\nHead %d:\n", h);
-            //     // for (int dst = 0; dst < num_nodes; ++dst) {
-            //     for (int dst = 15; dst < 16; ++dst) {
-            //         int row_start = h_row_ptr[dst];
-            //         int row_end = h_row_ptr[dst + 1];
-            //         for (int e = row_start; e < row_end; ++e) {
-            //             int src = h_col_idx[e];
-            //             float score = h_attn_coeff[l][h * num_edges + e];
-            //             printf("Edge (%d -> %d): %f\n", src, dst, score);
-            //         }  
-            //     }
         }
-            // //copy h_layer_outputs and h_h from device
-            // if (l == L - 1) {
-            //     cudaMemcpyAsync(h_layer_outputs[l], d_layer_outputs[l], num_nodes * out_dim[l] * sizeof(float), cudaMemcpyDeviceToHost);
-            //     cudaMemcpyAsync(h_h[l], d_h[l], num_nodes * out_dim[l] * sizeof(float), cudaMemcpyDeviceToHost);
-            // } else {
-            //     cudaMemcpyAsync(h_layer_outputs[l], d_layer_outputs[l], num_nodes * head[l] * out_dim[l] * sizeof(float), cudaMemcpyDeviceToHost);
-            //     cudaMemcpyAsync(h_h[l], d_h[l], num_nodes * head[l] * out_dim[l] * sizeof(float), cudaMemcpyDeviceToHost);
-            // }
-
-            // // print h_h[l] for each node i.e. pre-non-linearity output of size head[l] X out_dim[l] if not last layer else 1 X out_dim[l]
-            // for(int n=0; n<num_nodes; n++) {
-            //     printf("\nLayer %d  pre-activation output for Node %d:\n", l, n);
-            //     if (l == L - 1) {
-            //         for(int o=0; o<out_dim[l]; o++) {
-            //             printf("%f ", h_h[l][n * out_dim[l] + o]);
-            //         }
-            //     } else {
-            //         for(int h=0; h<head[l]; h++) {
-            //             printf("\nHead %d:\n", h);
-            //             for(int o=0; o<out_dim[l]; o++) {
-            //                 printf("%.17f ", h_h[l][(n * head[l] + h) * out_dim[l] + o]);
-            //             }
-            //         }
-            //     }
-            //     printf("\n");
-            // }
-
-            // //print h_layer_outputs[l] for each node in matrix form. if it is last layer output then for each node output will be 1 X out_dim[l] else it will be form of head[l] X out_dim[l]
-            // for(int n=0; n<num_nodes; n++) {
-            //     printf("\nLayer %d post-activation layer output for Node %d:\n", l, n);
-            //     if (l == L - 1) {
-            //         for(int o=0; o<out_dim[l]; o++) {
-            //             printf("%f ", h_layer_outputs[l][n * out_dim[l] + o]);
-            //         }
-            //     } else {
-            //         for(int h=0; h<head[l]; h++) {
-            //             printf("\nHead %d:\n", h);
-            //             for(int o=0; o<out_dim[l]; o++) {
-            //                 printf("%f ", h_layer_outputs[l][(n * head[l] + h) * out_dim[l] + o]);
-            //             }
-            //         }
-            //     }
-            //     printf("\n");
-            // }
-
-            //=========================================PRINTS END HERE==============================================
+        
     
         
         int threads_out = 128;
@@ -1577,28 +1438,6 @@ int main() {
         if (err != cudaSuccess) {
             fprintf(stderr, "Error launching gatv2_output_kernel: %s\n", cudaGetErrorString(err));
         }
-
-        //=========================================PRINT BLOCK===============================
-        // // Allocate host memory for d_y
-        // float* h_y = (float*)malloc(num_nodes * C * sizeof(float));
-
-        // // Copy d_y from device to host
-        // cudaMemcpy(h_y, d_y, num_nodes * C * sizeof(float), cudaMemcpyDeviceToHost);
-
-        // // Print d_y for each node
-        // printf("\nOutput probabilities (d_y):\n");
-        // // for (int n = 0; n < num_nodes; ++n) {
-        // for (int n = 15; n < 16; ++n) {
-        //     printf("Node %d: ", n);
-        //     for (int c = 0; c < C; ++c) {
-        //         printf("%.17f ", h_y[n * C + c]);
-        //     }    
-        //     printf("\n");
-        // }
-
-        // // Free host memory
-        // free(h_y);
-        //=========================================PRINT BLOCK END============================
        
         // c. ------------------------Calculate loss and accuracy -------------------------------------
         int threads_per_block_acc = 256;
@@ -1625,48 +1464,7 @@ int main() {
             fprintf(stderr, "Error launching compute_output_gradients: %s\n", cudaGetErrorString(err));
         }
 
-        // //==========================PRINTING GRADIENTS===========================
-        // // Allocate dynamic host memory for grad_wo
-        // // double* h_grad_wo = (double*)malloc(C * out_dim[L-1] * sizeof(double));
-
-        // // // Copy grad_wo from device to host
-        // // cudaMemcpy(h_grad_wo, grad_wo, C * out_dim[L-1] * sizeof(double), cudaMemcpyDeviceToHost);
-
-        // // // Print grad_wo for debugging
-        // // printf("\nGradients of output weights (grad_wo):\n");
-        // // for (int c = 0; c < C; ++c) {
-        // //     printf("Class %d: ", c);
-        // //     for (int od = 0; od < out_dim[L-1]; ++od) {
-        // //         printf("%.17lf ", h_grad_wo[c * out_dim[L-1] + od]);
-        // //     }
-        // //     printf("\n");
-        // // }
-
-        // // // Free host memory
-        // // free(h_grad_wo);
         
-        // // // Allocate dynamic host memory for grad_input
-        // // float* h_grad_input = (float*)malloc(num_nodes * head[L-1] * out_dim[L-1] * sizeof(float));
-
-        // // // Copy grad_input from device to host
-        // // cudaMemcpy(h_grad_input, grad_input, num_nodes * head[L-1] * out_dim[L-1] * sizeof(float), cudaMemcpyDeviceToHost);
-
-        // // // Print grad_input for debugging
-        // // printf("\nInput Gradient for Last Layer pre-nonlinearity(dL_dh):\n");
-        // // for (int n = 0; n < num_nodes; ++n) {
-        // //     printf("Node %d:\n", n);
-        // //     for (int h = 0; h < head[L-1]; ++h) {
-        // //     //printf("  Head %d: ", h);
-        // //     for (int od = 0; od < out_dim[L-1]; ++od) {
-        // //         printf("%.17f ", h_grad_input[(n * head[L-1] + h) * out_dim[L-1] + od]);
-        // //     }
-        // //     printf("\n");
-        // //     }
-        // // }
-        // // // Free host memory
-        // // free(h_grad_input);
-        // //============================PRINT END=================================================
-
 
         // 2: Loop backward through GAT layers
         float* grad_input = input_gradients[L-1]; // Start with last layer's input gradient buffer
@@ -1734,7 +1532,7 @@ int main() {
             int numThreads_preActGrad = 256;
             int numBlocks_preActGrad = (num_nodes + numThreads_preActGrad - 1) / numThreads_preActGrad;
             compute_preActivation_inputFeatures_gradient<<<numBlocks_preActGrad, numThreads_preActGrad>>>(
-                num_nodes, head[l], negative_slope, in_dim[l], d_h[l-1], input_gradients[l-1]
+                num_nodes, negative_slope, in_dim[l], d_h[l-1], input_gradients[l-1]
             );
             cudaDeviceSynchronize();
             // Check for errors after compute_preActivation_inputFeatures_gradient
@@ -1742,141 +1540,81 @@ int main() {
             if (err != cudaSuccess) {
                 fprintf(stderr, "Error launching compute_preActivation_inputFeatures_gradient: %s\n", cudaGetErrorString(err));
             }
-            //     // Prepare input gradient for next iteration down the stack
-                grad_input = input_gradients[l-1]; // Output gradient of current layer becomes input gradient for previous layer
+            // Prepare input gradient for next iteration down the stack
+            grad_input = input_gradients[l-1]; // Output gradient of current layer becomes input gradient for previous layer
         }
 
 
         // -----> *** 5. PARAMETER UPDATE SECTION —  ***
-
-        //     //---------_CLIP GRADIENTS___________________
-
+        if(clip){
+            //---------_CLIP GRADIENTS___________________
             clip_grad_norm(grad_d_w, total_w, 5.0f);   //  threshold=5
             clip_grad_norm(grad_d_a, total_a, 5.0f);
             clip_grad_norm(grad_wo, C * out_dim[L - 1], 5.0f);
-        // // //_________________________________________________
-        float lr = 0.0005f; // Set your learning rate
+            // //_________________________________________________
+        }
 
         int block_size = 256;
+        if(optimizer == "adam") {
+            //================ADAM UPDATE=========================
 
-        // // --- Update d_w ---
-        // //int num_blocks_w = (total_w + block_size - 1) / block_size;
-        // // adam_update_kernel<<<num_blocks_w, block_size>>>(d_w, grad_d_w, m_w, v_w, lr, total_w, 0.9f, 0.999f, 1e-8f, epoch);
-        // // err = cudaGetLastError();
-        // // if (err != cudaSuccess) {
-        // //     fprintf(stderr, "Error launching adam_update_kernel for d_w: %s\n", cudaGetErrorString(err));
-        // // }
+            //--- Update d_w ---
+            int num_blocks_w = (total_w + block_size - 1) / block_size;
+            adam_update_kernel<<<num_blocks_w, block_size>>>(d_w, grad_d_w, m_w, v_w, lr, total_w, beta1, beta2, 1e-8f, epoch);
+            err = cudaGetLastError();
+            if (err != cudaSuccess) {
+                fprintf(stderr, "Error launching adam_update_kernel for d_w: %s\n", cudaGetErrorString(err));
+            }
 
-        // // // --- Update attention vectors d_a ---
-        // // int num_blocks_a = (total_a + block_size - 1) / block_size;
-        // // adam_update_kernel<<<num_blocks_a, block_size>>>(d_a, grad_d_a, m_a, v_a, lr, total_a, 0.9f, 0.999f, 1e-8f, epoch);
-        // // err = cudaGetLastError();
-        // // if (err != cudaSuccess) {
-        // //     fprintf(stderr, "Error launching adam_update_kernel for d_a: %s\n", cudaGetErrorString(err));
-        // // }
+            // --- Update attention vectors d_a ---
+            int num_blocks_a = (total_a + block_size - 1) / block_size;
+            adam_update_kernel<<<num_blocks_a, block_size>>>(d_a, grad_d_a, m_a, v_a, lr, total_a, beta1, beta2, 1e-8f, epoch);
+            err = cudaGetLastError();
+            if (err != cudaSuccess) {
+                fprintf(stderr, "Error launching adam_update_kernel for d_a: %s\n", cudaGetErrorString(err));
+            }
 
-        // // // --- Update output weights d_wo ---
-        // // int total_wo = C * out_dim[L - 1];
-        // // int num_blocks_wo = (total_wo + block_size - 1) / block_size;
-        // // adam_update_kernel<<<num_blocks_wo, block_size>>>(d_wo, grad_wo, m_wo, v_wo, lr, total_wo, 0.9f, 0.999f, 1e-8f, epoch);
-        // // err = cudaGetLastError();
-        // // if (err != cudaSuccess) {
-        // //     fprintf(stderr, "Error launching adam_update_kernel for d_wo: %s\n", cudaGetErrorString(err));
-        // // }
-
-        // ----------------SGD UPDATE-----------------
-        int num_blocks_w = (total_w + block_size - 1) / block_size;
-        sgd_update_kernel<<<num_blocks_w, block_size>>>(d_w, grad_d_w, lr, total_w);
-        err = cudaGetLastError();
-        if (err != cudaSuccess) {
-            fprintf(stderr, "Error launching sgd_update_kernel for d_w: %s\n", cudaGetErrorString(err));
+            // --- Update output weights d_wo ---
+            int total_wo = C * out_dim[L - 1];
+            int num_blocks_wo = (total_wo + block_size - 1) / block_size;
+            adam_update_kernel<<<num_blocks_wo, block_size>>>(d_wo, grad_wo, m_wo, v_wo, lr, total_wo, beta1, beta2, 1e-8f, epoch);
+            err = cudaGetLastError();
+            if (err != cudaSuccess) {
+                fprintf(stderr, "Error launching adam_update_kernel for d_wo: %s\n", cudaGetErrorString(err));
+            }
         }
+        else if(optimizer == "sgd")
+        {
 
-        // --- Update attention vectors d_a ---
-        int num_blocks_a = (total_a + block_size - 1) / block_size;
-        sgd_update_kernel<<<num_blocks_a, block_size>>>(d_a, grad_d_a, lr, total_a);
-        err = cudaGetLastError();
-        if (err != cudaSuccess) {
-            fprintf(stderr, "Error launching sgd_update_kernel for d_a: %s\n", cudaGetErrorString(err));
-        }
+            // -------SGD UPDATE-----------------
+            int num_blocks_w = (total_w + block_size - 1) / block_size;
+            sgd_update_kernel<<<num_blocks_w, block_size>>>(d_w, grad_d_w, lr, total_w);
+            err = cudaGetLastError();
+            if (err != cudaSuccess) {
+                fprintf(stderr, "Error launching sgd_update_kernel for d_w: %s\n", cudaGetErrorString(err));
+            }
 
-        // --- Update output weights d_wo ---
-        int total_wo = C * out_dim[L - 1];
-        int num_blocks_wo = (total_wo + block_size - 1) / block_size;
-        sgd_update_kernel<<<num_blocks_wo, block_size>>>(d_wo, grad_wo, lr, total_wo);
-        err = cudaGetLastError();
-        if (err != cudaSuccess) {
-            fprintf(stderr, "Error launching sgd_update_kernel for d_wo: %s\n", cudaGetErrorString(err));
+            // --- Update attention vectors d_a ---
+            int num_blocks_a = (total_a + block_size - 1) / block_size;
+            sgd_update_kernel<<<num_blocks_a, block_size>>>(d_a, grad_d_a, lr, total_a);
+            err = cudaGetLastError();
+            if (err != cudaSuccess) {
+                fprintf(stderr, "Error launching sgd_update_kernel for d_a: %s\n", cudaGetErrorString(err));
+            }
+
+            // --- Update output weights d_wo ---
+            int total_wo = C * out_dim[L - 1];
+            int num_blocks_wo = (total_wo + block_size - 1) / block_size;
+            sgd_update_kernel<<<num_blocks_wo, block_size>>>(d_wo, grad_wo, lr, total_wo);
+            err = cudaGetLastError();
+            if (err != cudaSuccess) {
+                fprintf(stderr, "Error launching sgd_update_kernel for d_wo: %s\n", cudaGetErrorString(err));
+            }
         }
 
         cudaDeviceSynchronize();
 
-        // //     //================PRINT GRADIENTS FOR DEBUGGING=========================================
-        // //     //copy to host d_w, d_a, d_wo
-        // //     double* h_grad_w = new double[total_w];
-        // //     double* h_grad_a = new double[total_a];
-        // //     double* h_grad_wo = new double[total_wo];
-        // //     cudaMemcpy(h_grad_w, grad_d_w, total_w * sizeof(double), cudaMemcpyDeviceToHost);
-        // //     cudaMemcpy(h_grad_a, grad_d_a, total_a * sizeof(double), cudaMemcpyDeviceToHost);
-        // //     cudaMemcpy(h_grad_wo, grad_wo, total_wo * sizeof(double), cudaMemcpyDeviceToHost);
-
-        // //     // Print the copied values of gradients for debugging purpose for each layer separately. From each layer, print only the first 20 values.
-        // //     if(epoch == 1) {
-        // //         for (int l = 0; l < L; ++l) {
-        // //             printf("\nLayer %d:\n", l);
-
-        // //             // Print gradients of weights (h_grad_w) for this layer
-        // //             printf("Gradients of weights (h_grad_w):\n");
-        // //             int start_w = w_offset[l];
-        // //             int end_w = start_w + head[l] * out_dim[l] * 2 * in_dim[l];
-        // //             for (int i = start_w; i < start_w + 20 && i < end_w; ++i) {
-        // //                 printf("%.10lf ", h_grad_w[i]);
-        // //             }
-        // //             printf("\n");
-
-        // //             // Print gradients of attention vectors (h_grad_a) for this layer
-        // //             printf("Gradients of attention vectors (h_grad_a):\n");
-        // //             int start_a = a_offset[l];
-        // //             int end_a = start_a + head[l] * out_dim[l];
-        // //             for (int i = start_a; i < start_a + 20 && i < end_a; ++i) {
-        // //                 printf("%.10lf ", h_grad_a[i]);
-        // //             }
-        // //             printf("\n");
-        // //             }
-
-        // //             // Print gradients of output weights (h_grad_wo) for the final layer
-        // //             printf("\nGradients of output weights (h_grad_wo):\n");
-        // //             for (int i = 0; i < 20 && i < total_wo; ++i) {
-        // //                 printf("%.10lf ", h_grad_wo[i]);
-        // //             }
-        // //         printf("\n");
-        // //     }
-
-        // //     // Compute per-layer gradient norms
-        // //     printf("Per-Layer Gradient Norms:\n");
-        // //     for (int l = 0; l < L; ++l) {
-        // //         int start_w = w_offset[l];
-        // //         int layer_w_size = head[l] * out_dim[l] * 2 * in_dim[l];
-        // //         int start_a = a_offset[l];
-        // //         int layer_a_size = head[l] * out_dim[l];
-
-        // //         double norm_w_layer = compute_gradient_norm(&h_grad_w[start_w], layer_w_size);
-        // //         double norm_a_layer = compute_gradient_norm(&h_grad_a[start_a], layer_a_size);
-
-        // //         printf("  Layer %d - w-norms: %.10lf, a-norms: %.10lf\n", l, norm_w_layer, norm_a_layer);
-        // //     }
-
-        // //     // Add gradient norm for output weights (grad_wo)
-        // //     double norm_wo = compute_gradient_norm(h_grad_wo, total_wo);
-        // //     printf("Output Layer Gradient Norm:\n");
-        // //     printf("  grad_wo: %.10lf\n", norm_wo);
-
-        // //     // Clean up
-        // //     delete[] h_grad_w;
-        // //     delete[] h_grad_a;
-        // //     delete[] h_grad_wo;
-
-        // //   ==========================================================================================
+        // 6. Reset gradients to zero for next epoch
 
         cudaMemset(grad_d_w, 0, total_w * sizeof(float));
         cudaMemset(grad_d_a, 0, total_a * sizeof(float));
@@ -1889,8 +1627,8 @@ int main() {
         auto stop = std::chrono::high_resolution_clock::now();
         std::chrono::duration<double, std::milli> elapsed = stop - start;
         std::cout <<  " total time: " << elapsed.count() << " ms" << std::endl;
-
     }
+
 
 
 }
