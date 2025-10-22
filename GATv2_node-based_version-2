@@ -969,6 +969,12 @@ __global__ void compute_loss_accuracy_kernel(
 
 
 int main(int argc, char** argv) {
+    // Measure GPU memory before allocations
+    size_t free_before, total_mem;
+    cudaMemGetInfo(&free_before, &total_mem);
+    printf("\n[Memory Tracker] Before allocation:\n");
+    printf("  Total GPU memory: %.2f MB\n", total_mem / (1024.0 * 1024.0));
+    printf("  Free GPU memory : %.2f MB\n", free_before / (1024.0 * 1024.0));
     // Default hyperparameters
     int epochs = 200;
     int L = 2;
@@ -1211,7 +1217,7 @@ int main(int argc, char** argv) {
     total_w += head[L-1] * out_dim[L-1] * in_dim[L-1]; // Last layer weights
     total_a += head[L-1] * out_dim[L-1]; // Last layer attention vectors
 
-    printf("Total size of learnable parameters for all layers: %zu KB\n", (total_w+ total_a + (C*out_dim[L-1]) * sizeof(float)) / (1024));
+    printf("\n Total size of learnable parameters for all layers: %zu KB\n", (total_w+ total_a + (C*out_dim[L-1]) * sizeof(float)) / (1024));
     // Start timer
     // auto start = std::chrono::high_resolution_clock::now();
 
@@ -1393,6 +1399,15 @@ int main(int argc, char** argv) {
         fprintf(stderr, "Error launching csr_to_coo_kernel: %s\n", cudaGetErrorString(err));
     }    
     //==================END===========================================
+
+    // Measure GPU memory after all allocations
+    size_t free_after;
+    cudaMemGetInfo(&free_after, &total_mem);
+    double used_mb = (double)(free_before - free_after) / (1024.0 * 1024.0);
+
+    printf("\n[Memory Tracker] After all allocations:\n");
+    printf("  Free GPU memory : %.2f MB\n", free_after / (1024.0 * 1024.0));
+    printf("  Approx. GPU memory allocated by this program: %.2f MB\n", used_mb);
 
     for (int epoch = 1; epoch <= epochs; ++epoch) {
         printf("\nEpoch %d\n", epoch);
@@ -1635,12 +1650,6 @@ int main(int argc, char** argv) {
         std::cout <<  " total time: " << elapsed.count() << " ms" << std::endl;
 
     }
-
-
-    // // Stop timer
-    // auto stop = std::chrono::high_resolution_clock::now();
-    // std::chrono::duration<double, std::milli> elapsed = stop - start;
-    // std::cout <<  " total time: " << elapsed.count() << " ms" << std::endl;
 
 
 }
