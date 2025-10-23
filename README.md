@@ -63,6 +63,22 @@ This will produce executables `train_node` and `train_edge` respectively. Make s
  `!nvcc -std=c++17 -arch=sm_75 GATv2_node_based.cu -o train_node`
 `!./train_node --num-layers 3`
 
+####  Running Environment:
+1. Local Machine:
+   - Remove the first line `"%%writefile cuda.cu"` when running locally
+   - Compile directly with nvcc
+
+2. Google Colab/Kaggle:
+   - Keep the first line `"%%writefile cuda.cu"`
+   - This magic command will create a .cu file in your notebook environment
+   - This is necessary because Colab/Kaggle use Jupyter notebooks and cannot compile CUDA code directly
+   - After running the cell with the code, you'll need to compile the generated .cu file separately
+
+Example for Colab/Kaggle workflow:
+1. Run the cell with the code (including `%%writefile cuda.cu)`
+2. Compile using: `!nvcc cuda.cu -o cuda_program`
+3. Run using: `!./cuda_program`
+
 ## Usage Instructions
 After compiling, you can run the training program with various command-line options to configure the model and training hyperparameters. **Both  `train_node`  and  `train_edge`  accept the same arguments.** The primary difference is which kernel implementation they use internally. Both will train a GATv2 model on the specified dataset.
 
